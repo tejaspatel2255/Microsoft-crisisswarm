@@ -309,6 +309,10 @@ def reload_rotator() -> None:
         _rotator = GroqKeyRotator()
     _verify_cache = None
 
+_VERIFY_CACHE: Optional[Tuple[bool, str]] = None
+_VERIFY_CACHE_TS: float = 0.0
+_VERIFY_DEFAULT_TTL = 30.0
+
 
 def resolve_model(model: Optional[str] = None) -> str:
     """Return a supported Groq model id, migrating deprecated names."""
