@@ -636,12 +636,114 @@ st.text_area(
 # ACTIVATE SWARM
 # ---------------------------------------------------------------------------
 if st.button("🚨 ACTIVATE SWARM", type="primary", use_container_width=True):
-    with st.spinner("Running initial swarm (up to Routing)..."):
-        st.session_state["partial_out"] = run_swarm_partial(st.session_state["scenario_input"])
-        st.session_state["last_scenario_text"] = st.session_state["scenario_input"]
-        st.session_state["approval_stage"] = "awaiting_approval"
-        st.session_state["swarm_out"] = None
-        st.rerun()
+    scenario = st.session_state["scenario_input"]
+    
+    with st.status("🚨 Swarm pipeline running...", expanded=True) as status:
+        st.write("📡 Step 1/5 — Parsing disaster situation...")
+        
+        # Import what we need for inline steps
+        from core.situation import parse_situation
+        from core.context import SwarmContext
+        from core.scenario import zone_coords_for_scenario
+        import importlib, time
+        from core.agent_llm import step_metadata
+        from core import groq_client
+        groq_client.reset_swarm_session()
+        
+        import time as _time
+        t0 = _time.perf_counter()
+        situation = parse_situation(scenario)
+        lat_ms = int((_time.perf_counter() - t0) * 1000)
+        
+        src = "🟢 Groq" if situation.get("source") == "groq" else "⚪ Offline"
+        loc = situation.get("location", "unknown location")
+        dtype = situation.get("disaster_type", "disaster")
+        st.write(f"✅ Situation parsed — {dtype} at {loc} ({src}, {lat_ms}ms)")
+        
+        st.write("⚔️ Step 2/5 — Commander + Triage assigning zones...")
+        commander_mod = importlib.import_module("agents.commander")
+        ctx = SwarmContext(scenario_text=scenario, situation=situation)
+        commander = getattr(commander_mod, "Commander")()
+        plan = commander.run_triage_then_plan(scenario, context=ctx)
+        
+        triage_zones = plan.get("triage", {}).get("zones", {})
+        zone_summary = ", ".join(
+            f"{z}: {info.get('estimated_total', 0)}"
+            for z, info in list(triage_zones.items())[:3]
+        )
+        llm_badge = "🟢 Groq" if plan.get("llm_used") else "⚪ Offline"
+        st.write(f"✅ Triage complete — {zone_summary} casualties ({llm_badge})")
+        
+        st.write("🏥 Step 3/5 — Resource allocating ambulances and teams...")
+        resource_mod = importlib.import_module("agents.resource")
+        allocations = resource_mod.allocate_resources(plan, context=ctx)
+        
+        total_amb = sum(
+            a.get("ambulances", 0)
+            for a in allocations.get("allocations", [])
+        )
+        llm_badge = "🟢 Groq" if allocations.get("llm_used") else "⚪ Offline"
+        st.write(f"✅ Resources allocated — {total_amb} ambulances dispatched ({llm_badge})")
+        
+        st.write("🗺️ Step 4/5 — Routing planning ETAs and deployment order...")
+        routing_mod = importlib.import_module("agents.routing")
+        routes = routing_mod.plan_routes(
+            plan.get("task_assignments", []),
+            context=ctx,
+            allocations=allocations,
+        )
+        
+        engine = routes.get("routing_engine", "haversine")
+        order = routes.get("route_order", [])
+        order_str = " → ".join(order[:3]) if order else "zones"
+        llm_badge = "🟢 Groq" if routes.get("llm_used") else "⚪ Offline"
+        st.write(f"✅ Routes planned — {order_str} ({engine}, {llm_badge})")
+        
+        # Build partial_out manually (same structure as run_swarm_partial)
+        from core.agent_llm import step_metadata
+        from core.groq_client import get_last_key_used, resolve_model
+        
+        def _sit_step(sit, ms):
+            groq_live = sit.get("source") == "groq"
+            return {
+                "agent": "Situation",
+                "llm_used": groq_live,
+                "model_used": resolve_model() if groq_live else "offline",
+                "latency_ms": ms,
+                "mode": "groq" if groq_live else "offline",
+                "llm_error": sit.get("parse_error"),
+            }
+        
+        agent_steps = [
+            _sit_step(situation, lat_ms),
+            step_metadata(plan, "Commander"),
+        ]
+        triage = plan.get("triage") or {}
+        if triage:
+            agent_steps.append(step_metadata(triage, "Triage"))
+        agent_steps.append(step_metadata(allocations, "Resource"))
+        agent_steps.append(step_metadata(routes, "Routing"))
+        
+        partial_out = {
+            "situation": situation,
+            "plan": plan,
+            "allocations": allocations,
+            "routes": routes,
+            "agent_steps": agent_steps,
+        }
+        
+        st.write("⚠️ Step 5/5 — Awaiting human approval before Comms...")
+        status.update(
+            label="✅ Initial pipeline complete — review plan below",
+            state="complete",
+            expanded=False,
+        )
+    
+    st.session_state["partial_out"] = partial_out
+    st.session_state["last_scenario_text"] = scenario
+    st.session_state["approval_stage"] = "awaiting_approval"
+    st.session_state["swarm_out"] = None
+    st.rerun()
 
 if st.session_state["approval_stage"] == "awaiting_approval":
     out = st.session_state["partial_out"]
@@ -689,13 +791,99 @@ if st.session_state["approval_stage"] == "awaiting_approval":
             col1, col2 = st.columns(2)
             if approved:
                 if col1.button("✅ APPROVE & SEND COMMS", type="primary"):
-                    with st.spinner("Completing swarm pipeline..."):
-                        st.session_state["swarm_out"] = run_swarm_complete(
-                            st.session_state["partial_out"], 
-                            st.session_state["last_scenario_text"]
+                    import importlib
+                    from core.analysis import build_analysis_payload
+                    from core.agent_llm import step_metadata
+                    
+                    partial = st.session_state["partial_out"]
+                    scenario = st.session_state["last_scenario_text"]
+                    situation = partial.get("situation", {})
+                    plan = partial.get("plan", {})
+                    allocations = partial.get("allocations", {})
+                    routes = partial.get("routes", {})
+                    agent_steps = list(partial.get("agent_steps", []))
+                    
+                    from core.context import SwarmContext
+                    ctx = SwarmContext(scenario_text=scenario, situation=situation)
+                    
+                    with st.status("📡 Broadcasting alerts...", expanded=True) as status:
+                        st.write("📢 Step 6/8 — Comms broadcasting alerts...")
+                        comms_mod = importlib.import_module("agents.comms")
+                        comms = comms_mod.send_alerts(
+                            context=ctx, plan=plan,
+                            allocations=allocations, routes=routes,
                         )
-                        st.session_state["approval_stage"] = "complete"
-                        st.rerun()
+                        delivery_count = len(comms.get("delivery_log", []))
+                        llm_badge = "🟢 Groq" if comms.get("llm_used") else "⚪ Offline"
+                        agent_steps.append(step_metadata(comms, "Comms"))
+                        st.write(f"✅ Comms sent — {delivery_count} alerts dispatched ({llm_badge})")
+                        
+                        st.write("🔍 Step 7/8 — Verifier cross-checking all outputs...")
+                        verifier_mod = importlib.import_module("agents.verifier")
+                        verifier = verifier_mod.verify_outputs(
+                            ctx, plan, allocations, routes, comms
+                        )
+                        approved_str = "APPROVED ✅" if verifier.get("approved") else "REVIEW NEEDED ⚠️"
+                        score = verifier.get("confidence_score", 0)
+                        llm_badge = "🟢 Groq" if verifier.get("llm_used") else "⚪ Offline"
+                        agent_steps.append(step_metadata(verifier, "Verifier"))
+                        st.write(f"✅ Verifier: {approved_str} — {score}% confidence ({llm_badge})")
+                        
+                        st.write("📊 Step 8/8 — Analysis and Reporter generating SitRep...")
+                        analysis = build_analysis_payload(
+                            scenario, plan, allocations, routes,
+                            context=ctx, comms=comms
+                        )
+                        agent_steps.append(step_metadata(analysis, "Analysis"))
+                        
+                        reporter_mod = importlib.import_module("agents.reporter")
+                        report = reporter_mod.generate_report(
+                            plan, allocations, routes,
+                            context=ctx, comms=comms,
+                            analysis=analysis, verifier=verifier,
+                        )
+                        agent_steps.append(step_metadata(report, "Reporter"))
+                        
+                        action_count = len(analysis.get("recommended_actions", []))
+                        st.write(f"✅ SitRep complete — {action_count} recommended actions")
+                        
+                        status.update(
+                            label="🚨 Swarm complete — full report ready",
+                            state="complete",
+                            expanded=False,
+                        )
+                    
+                    # Build full output
+                    from core.swarm import build_transcript, _collect_agent_errors
+                    outputs = {
+                        "plan": plan, "allocations": allocations, "routes": routes,
+                        "comms": comms, "verifier": verifier,
+                        "analysis": analysis, "report": report,
+                    }
+                    transcript = build_transcript(ctx, outputs)
+                    llm_agents = sum(1 for s in agent_steps if s.get("llm_used"))
+                    agent_errors = _collect_agent_errors(outputs)
+                    mode = "groq_multi_agent" if llm_agents >= 3 else (
+                        "groq_partial" if llm_agents > 0 else "offline_pipeline"
+                    )
+                    
+                    full_out = {
+                        "mode": mode,
+                        "groq_live": llm_agents > 0,
+                        "groq_status": f"{llm_agents} of {len(agent_steps)} agents used Groq",
+                        "groq_model": groq_client.resolve_model() if groq_client.is_configured() else None,
+                        "situation": situation, "plan": plan,
+                        "allocations": allocations, "routes": routes,
+                        "comms": comms, "verifier": verifier,
+                        "report": report, "analysis": analysis,
+                        "transcript": transcript, "agent_steps": agent_steps,
+                        "agents_with_llm": llm_agents,
+                        "agent_errors": agent_errors,
+                    }
+                    
+                    st.session_state["swarm_out"] = full_out
+                    st.session_state["approval_stage"] = "complete"
+                    st.rerun()
                         
             if col2.button("❌ Cancel & Re-run"):
                 st.session_state["approval_stage"] = "idle"
